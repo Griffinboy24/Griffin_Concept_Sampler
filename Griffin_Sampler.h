@@ -34,11 +34,10 @@ namespace project
     struct SampleSettings
     {
         double pitchOffsetCents = 0.0;       // In cents; 0 means no detune.
-        float  volumeMult = 1.0f;        // Multiplies the note's velocity.
-        float  panning = 0.0f;        // -1 (left) to +1 (right); used in a simple crossfade.
-        float  startOffsetInSamples = 0.0f;     // Calculated sample start offset.
-        float  endOffsetInSamples = 0.0f;     // Calculated sample end offset.
-        bool   reverse = false;       // If true, playback goes in reverse.
+        float  volumeMult = 1.0f;            // Multiplies the note's velocity.
+        float  panning = 0.0f;               // -1 (left) to +1 (right); used in a simple crossfade.
+        float  startOffsetInSamples = 0.0f;  // Calculated sample start offset.
+        float  endOffsetInSamples = 0.0f;    // Calculated sample end offset.
     };
 
     // Single instance of sample playback for a note.
@@ -79,55 +78,41 @@ namespace project
 
             // Set phase accumulator at the start offset.
             phaseAcc = (int64_t)std::llround(startOff * FIXED_ONE);
-            // Save the endpoint (for non-reverse, endpoint is higher than start)
+            // Save the endpoint (for forward playback, endpoint is higher than start)
             endOffset = endOff;
 
             // Compute playback rate (pitch shift) based on base delta and detune in cents.
             double centsFact = std::pow(2.0, (s.pitchOffsetCents / 1200.0));
             double effectiveSpeed = baseDelta * centsFact;
             phaseInc = (int64_t)std::llround(effectiveSpeed * FIXED_ONE);
-            if (s.reverse)
-            {
-                phaseInc = -phaseInc;
-                // For reverse playback, swap start and end: playback will end when phaseAcc <= endOff.
-                endOffset = startOff;
-            }
         }
 
-        // Synthesis loop: perform sample read with linear interpolation between start and end.
+        // Synthesis loop: perform sample read with linear interpolation.
         int vectorSynthesize(float* outL, float* outR, int blockSize)
         {
             if (!active)
                 return 0;
             int processed = 0;
+            const float invFixedOne = 1.f / FIXED_ONE;
             const float leftGain = 0.5f * (1.f - settings.panning);
             const float rightGain = 0.5f * (1.f + settings.panning);
+            const float ampLeft = amplitude * leftGain;
+            const float ampRight = amplitude * rightGain;
+
             while (processed < blockSize)
             {
-                int64_t acc = phaseAcc >> FIXED_SHIFT;
-                int idx = (int)acc;
-                // Check if we've reached the designated end point.
-                if (!settings.reverse)
+                int idx = int(phaseAcc >> FIXED_SHIFT);
+                // End playback if the sample index reaches or exceeds the endpoint.
+                if (float(idx) >= endOffset)
                 {
-                    if (float(idx) >= endOffset)
-                    {
-                        active = false;
-                        break;
-                    }
+                    active = false;
+                    break;
                 }
-                else
-                {
-                    if (float(idx) <= endOffset)
-                    {
-                        active = false;
-                        break;
-                    }
-                }
-                float frac = float(phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+                float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
                 float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
                 float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
-                outL[processed] += sampL * amplitude * leftGain;
-                outR[processed] += sampR * amplitude * rightGain;
+                outL[processed] += sampL * ampLeft;
+                outR[processed] += sampR * ampRight;
                 phaseAcc += phaseInc;
                 processed++;
             }
@@ -170,7 +155,6 @@ namespace project
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        std::vector<Voice*> activeVoices;
         PolyData<Voice, NV> voices;
         ExternalData sampleData;
         AudioBuffer<float> sampleBuffer;
@@ -181,14 +165,13 @@ namespace project
         double sampleRateRatio = 1.0;
 
         // Parameters for sample playback range (start and end positions as percentages)
-        float sampleStartPercent = 0.0f;      // Relative start point in the sample [0, 1].
-        float sampleEndPercent = 1.0f;        // Relative end point in the sample [0, 1].
+        float sampleStartPercent = 0.0f;     // Relative start point in the sample [0, 1].
+        float sampleEndPercent = 1.0f;       // Relative end point in the sample [0, 1].
         // Calculated absolute positions in samples.
         float sampleStartOffsetInSamples = 0.0f;
         float sampleEndOffsetInSamples = 0.0f;
 
-        bool forceReverse = false;            // If true, playback is forced in reverse.
-        double globalPitchOffsetFactor = 1.0;   // Acts as a pitch multiplier.
+        double globalPitchOffsetFactor = 1.0;  // Acts as a pitch multiplier.
         std::mt19937 randomGen;
 
         // Load external sample data.
@@ -239,8 +222,6 @@ namespace project
             initPitchRatios();
             updateDerivedParameters();
             voices.prepare(specs);
-            activeVoices.clear();
-            activeVoices.reserve(NV);
             std::random_device rd;
             randomGen.seed(rd());
         }
@@ -259,7 +240,6 @@ namespace project
                 settings.panning = 0.0f;
                 settings.startOffsetInSamples = sampleStartOffsetInSamples;
                 settings.endOffsetInSamples = sampleEndOffsetInSamples;
-                settings.reverse = forceReverse;
                 voice.reset(e.getNoteNumber(), e.getFloatVelocity(), sample,
                     sampleBuffer.getNumSamples(), baseDelta, settings);
             }
@@ -281,25 +261,13 @@ namespace project
             std::fill(leftChannel, leftChannel + totalSamples, 0.f);
             std::fill(rightChannel, rightChannel + totalSamples, 0.f);
 
-            activeVoices.clear();
             for (auto& voice : voices)
             {
-                if (voice.isActive)
-                    activeVoices.push_back(&voice);
-            }
-            std::vector<float> tempBlockOutL(totalSamples, 0.f);
-            std::vector<float> tempBlockOutR(totalSamples, 0.f);
-
-            for (auto* vptr : activeVoices)
-            {
-                int n = vptr->playback.vectorSynthesize(tempBlockOutL.data(), tempBlockOutR.data(), totalSamples);
-                if (!vptr->playback.active)
-                    vptr->isActive = false;
-            }
-            for (int i = 0; i < totalSamples; ++i)
-            {
-                leftChannel[i] += tempBlockOutL[i];
-                rightChannel[i] += tempBlockOutR[i];
+                if (!voice.isActive)
+                    continue;
+                int n = voice.playback.vectorSynthesize(leftChannel, rightChannel, totalSamples);
+                if (!voice.playback.active)
+                    voice.isActive = false;
             }
         }
 
@@ -310,7 +278,6 @@ namespace project
         // Index 0: Pitch multiplier
         // Index 1: Sample Start (percent)
         // Index 2: Sample End (percent)
-        // Index 3: Reverse flag
         template <int P>
         void setParameter(double v)
         {
@@ -327,10 +294,6 @@ namespace project
             {
                 sampleEndPercent = (float)v;
                 updateDerivedParameters();
-            }
-            else if constexpr (P == 3)
-            {
-                forceReverse = (v >= 0.5);
             }
         }
 
@@ -359,12 +322,6 @@ namespace project
                 registerCallback<2>(endParam);
                 endParam.setDefaultValue(1.0);
                 data.add(std::move(endParam));
-            }
-            {
-                parameter::data reverseParam("Reverse", { 0.0, 1.0, 1.0 });
-                registerCallback<3>(reverseParam);
-                reverseParam.setDefaultValue(0.0);
-                data.add(std::move(reverseParam));
             }
         }
     };
