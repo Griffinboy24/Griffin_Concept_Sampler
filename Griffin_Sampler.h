@@ -33,11 +33,14 @@ namespace project
     // Settings for sample playback
     struct SampleSettings
     {
-        double pitchOffsetCents = 0.0;       // In cents; 0 means no detune.
-        float  volumeMult = 1.0f;            // Multiplies the note's velocity.
-        float  panning = 0.0f;               // -1 (left) to +1 (right); used in a simple crossfade.
-        float  startOffsetInSamples = 0.0f;  // Calculated sample start offset.
-        float  endOffsetInSamples = 0.0f;    // Calculated sample end offset.
+        double pitchOffsetCents = 0.0;       // in cents; 0 means no detune
+        float  volumeMult = 1.0f;            // multiplies velocity
+        float  panning = 0.0f;               // -1 (L) to +1 (R)
+        float  startOffsetInSamples = 0.0f;  // absolute start (inside the file)
+        float  endOffsetInSamples = 0.0f;    // absolute end (inside the file)
+
+        bool   loopMode = false;             // false = one-shot, true = loop
+        float  xfadeLengthInSamples = 0.0f;  // actual crossfade length in samples (computed)
     };
 
     // Single instance of sample playback for a note.
@@ -50,7 +53,8 @@ namespace project
         SampleSettings settings;
         int64_t phaseAcc = 0;
         int64_t phaseInc = 0;
-        float endOffset = 0.0f;  // Absolute endpoint for playback
+        float startOffset = 0.0f; // s
+        float endOffset = 0.0f;   // e
 
         SamplePlayback() noexcept = default;
 
@@ -64,34 +68,36 @@ namespace project
             amplitude = amp * s.volumeMult;
             active = true;
 
-            // Clamp start and end offsets to valid range.
-            float startOff = s.startOffsetInSamples;
-            float endOff = s.endOffsetInSamples;
-            if (startOff < 0.f)
-                startOff = 0.f;
-            if (startOff > float(bufferLength - 1))
-                startOff = float(bufferLength - 1);
-            if (endOff < 0.f)
-                endOff = 0.f;
-            if (endOff > float(bufferLength - 1))
-                endOff = float(bufferLength - 1);
+            float sOff = s.startOffsetInSamples;
+            float eOff = s.endOffsetInSamples;
+            if (sOff < 0.f) sOff = 0.f;
+            if (sOff > float(bufferLength - 1)) sOff = float(bufferLength - 1);
+            if (eOff < 0.f) eOff = 0.f;
+            if (eOff > float(bufferLength - 1)) eOff = float(bufferLength - 1);
 
-            // Set phase accumulator at the start offset.
-            phaseAcc = (int64_t)std::llround(startOff * FIXED_ONE);
-            // Save the endpoint (for forward playback, endpoint is higher than start)
-            endOffset = endOff;
+            startOffset = sOff;
+            endOffset = eOff;
 
-            // Compute playback rate (pitch shift) based on base delta and detune in cents.
+            // Begin playback at sample start.
+            phaseAcc = (int64_t)std::llround(sOff * FIXED_ONE);
+
             double centsFact = std::pow(2.0, (s.pitchOffsetCents / 1200.0));
             double effectiveSpeed = baseDelta * centsFact;
             phaseInc = (int64_t)std::llround(effectiveSpeed * FIXED_ONE);
         }
 
-        // Synthesis loop: perform sample read with linear interpolation.
+        // Synthesis loop: output one block of samples.
+        // This implements standard crossfade looping:
+        // - For positions p < (e - X): output sample normally.
+        // - For p in [e - X, e): output crossfade between tail (at p)
+        //   and head (at s + (p - (e - X))).
+        // When p reaches or exceeds e, subtract (e - s - X) so that
+        // the overlapping head region [s, s+X] is used.
         int vectorSynthesize(float* outL, float* outR, int blockSize)
         {
             if (!active)
                 return 0;
+
             int processed = 0;
             const float invFixedOne = 1.f / FIXED_ONE;
             const float leftGain = 0.5f * (1.f - settings.panning);
@@ -99,22 +105,72 @@ namespace project
             const float ampLeft = amplitude * leftGain;
             const float ampRight = amplitude * rightGain;
 
+            // Precomputed loop values:
+            const bool loopEnabled = settings.loopMode;
+            const float X = settings.xfadeLengthInSamples; // crossfade length
+            const float sOff = startOffset;
+            const float eOff = endOffset;
+            const float L = (eOff > sOff) ? (eOff - sOff) : 0.f; // total region length
+
             while (processed < blockSize)
             {
-                int idx = int(phaseAcc >> FIXED_SHIFT);
-                // End playback if the sample index reaches or exceeds the endpoint.
-                if (float(idx) >= endOffset)
+                float p = float(phaseAcc >> FIXED_SHIFT) +
+                    float(phaseAcc & FIXED_MASK) * invFixedOne;
+
+                if (!loopEnabled && p >= eOff)
                 {
                     active = false;
                     break;
                 }
-                float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
-                float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
-                float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+
+                float sampL = 0.f, sampR = 0.f;
+                // If looping with crossfade and X > 0, check if we're in the crossfade zone.
+                if (loopEnabled && X > 0.f && p >= (eOff - X))
+                {
+                    float alpha = (p - (eOff - X)) / X;
+                    // Tail: sample at current position.
+                    int idxTail = int(p);
+                    float fracTail = p - float(idxTail);
+                    float tailL = sourceL[idxTail] + fracTail * (sourceL[idxTail + 1] - sourceL[idxTail]);
+                    float tailR = sourceR[idxTail] + fracTail * (sourceR[idxTail + 1] - sourceR[idxTail]);
+                    // Head: corresponding sample from the beginning of the region.
+                    float headPos = sOff + (p - (eOff - X));
+                    int idxHead = int(headPos);
+                    float fracHead = headPos - float(idxHead);
+                    float headL = sourceL[idxHead] + fracHead * (sourceL[idxHead + 1] - sourceL[idxHead]);
+                    float headR = sourceR[idxHead] + fracHead * (sourceR[idxHead + 1] - sourceR[idxHead]);
+                    sampL = (1.f - alpha) * tailL + alpha * headL;
+                    sampR = (1.f - alpha) * tailR + alpha * headR;
+                }
+                else
+                {
+                    int idx = int(p);
+                    float frac = p - float(idx);
+                    sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
+                    sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+                }
+
                 outL[processed] += sampL * ampLeft;
                 outR[processed] += sampR * ampRight;
-                phaseAcc += phaseInc;
                 processed++;
+
+                phaseAcc += phaseInc;
+
+                if (loopEnabled)
+                {
+                    float p_next = float(phaseAcc >> FIXED_SHIFT) +
+                        float(phaseAcc & FIXED_MASK) * invFixedOne;
+                    // When p_next exceeds the region, wrap it.
+                    // The effective unique portion is (eOff - sOff - X).
+                    if (p_next >= eOff)
+                    {
+                        float wrapAmt = (eOff - sOff - X);
+                        if (wrapAmt < 0.f)
+                            wrapAmt = 0.f;
+                        p_next -= wrapAmt;
+                        phaseAcc = (int64_t)std::llround(p_next * FIXED_ONE);
+                    }
+                }
             }
             return processed;
         }
@@ -125,9 +181,9 @@ namespace project
         int midiNote = 60;
         bool isActive = false;
         float velocity = 1.0f;
-        SamplePlayback playback; // Single instance of sample playback for this note.
+        SamplePlayback playback; // instance of sample playback
 
-        // Reset the voice by instantiating a new SamplePlayback for the note.
+        // Reset the voice with a new SamplePlayback.
         void reset(int note, float vel, const std::array<const float*, 2>& sample,
             int bufferLength, double baseDelta, const SampleSettings& settings)
         {
@@ -164,14 +220,19 @@ namespace project
         double sampleRate = 44100.0;
         double sampleRateRatio = 1.0;
 
-        // Parameters for sample playback range (start and end positions as percentages)
-        float sampleStartPercent = 0.0f;     // Relative start point in the sample [0, 1].
-        float sampleEndPercent = 1.0f;       // Relative end point in the sample [0, 1].
-        // Calculated absolute positions in samples.
+        // Playback range parameters (percent)
+        float sampleStartPercent = 0.0f;
+        float sampleEndPercent = 1.0f;
         float sampleStartOffsetInSamples = 0.0f;
         float sampleEndOffsetInSamples = 0.0f;
 
-        double globalPitchOffsetFactor = 1.0;  // Acts as a pitch multiplier.
+        double globalPitchOffsetFactor = 1.0;
+
+        // Loop / crossfade parameters
+        bool  loopMode = false;            // Parameter 3
+        float xfadeFraction = 0.0f;         // Parameter 4 (0..1)
+        float xfadeLengthInSamples = 0.0f;  // Computed crossfade length
+
         std::mt19937 randomGen;
 
         // Load external sample data.
@@ -198,6 +259,7 @@ namespace project
                 sample[1] = sampleBuffer.getReadPointer(1);
             else
                 sample[1] = sample[0];
+
             updateDerivedParameters();
         }
 
@@ -206,8 +268,20 @@ namespace project
             int currentSampleLength = sampleBuffer.getNumSamples();
             if (currentSampleLength < 1)
                 currentSampleLength = 1;
+
             sampleStartOffsetInSamples = sampleStartPercent * float(currentSampleLength - 1);
             sampleEndOffsetInSamples = sampleEndPercent * float(currentSampleLength - 1);
+
+            float regionLen = sampleEndOffsetInSamples - sampleStartOffsetInSamples;
+            if (regionLen < 0.f)
+                regionLen = 0.f;
+
+            // Clamp crossfade: maximum allowed is half the region.
+            float maxXfade = regionLen * 0.5f;
+            float desiredXfade = xfadeFraction * regionLen;
+            if (desiredXfade > maxXfade)
+                desiredXfade = maxXfade;
+            xfadeLengthInSamples = desiredXfade;
         }
 
         void reset()
@@ -226,20 +300,21 @@ namespace project
             randomGen.seed(rd());
         }
 
-        // On note on, schedule a single voice.
+        // On note on, schedule a voice.
         void handleHiseEvent(HiseEvent& e)
         {
             if (e.isNoteOn())
             {
                 auto& voice = voices.get();
                 double baseDelta = pitchRatios[e.getNoteNumber()] * sampleRateRatio * globalPitchOffsetFactor;
-                // Prepare sample playback settings.
                 SampleSettings settings;
-                settings.pitchOffsetCents = 0.0; // No detune by default.
+                settings.pitchOffsetCents = 0.0;
                 settings.volumeMult = 1.0f;
                 settings.panning = 0.0f;
                 settings.startOffsetInSamples = sampleStartOffsetInSamples;
                 settings.endOffsetInSamples = sampleEndOffsetInSamples;
+                settings.loopMode = loopMode;
+                settings.xfadeLengthInSamples = xfadeLengthInSamples;
                 voice.reset(e.getNoteNumber(), e.getFloatVelocity(), sample,
                     sampleBuffer.getNumSamples(), baseDelta, settings);
             }
@@ -253,11 +328,13 @@ namespace project
             auto* leftChannel = audioBlock.getChannelPointer(0);
             auto* rightChannel = audioBlock.getChannelPointer(1);
             int totalSamples = data.getNumSamples();
+
             if (sampleBuffer.getNumSamples() == 0)
             {
                 audioBlock.clear();
                 return;
             }
+
             std::fill(leftChannel, leftChannel + totalSamples, 0.f);
             std::fill(rightChannel, rightChannel + totalSamples, 0.f);
 
@@ -265,6 +342,7 @@ namespace project
             {
                 if (!voice.isActive)
                     continue;
+
                 int n = voice.playback.vectorSynthesize(leftChannel, rightChannel, totalSamples);
                 if (!voice.playback.active)
                     voice.isActive = false;
@@ -275,15 +353,27 @@ namespace project
         void processFrame(FrameDataType&) {}
 
         // Parameter mapping:
-        // Index 0: Pitch multiplier
-        // Index 1: Sample Start (percent)
-        // Index 2: Sample End (percent)
+        // 0: Pitch (semitones, -24 to 24)
+        // 1: Sample Start (percent)
+        // 2: Sample End (percent)
+        // 3: Loop Mode (0..1; false if <0.5)
+        // 4: Xfade Length (0..1)
         template <int P>
         void setParameter(double v)
         {
             if constexpr (P == 0)
             {
-                globalPitchOffsetFactor = v;
+                globalPitchOffsetFactor = std::pow(2.0, v / 12.0);
+                for (auto& voice : voices)
+                {
+                    if (voice.isActive)
+                    {
+                        double newBaseDelta = pitchRatios[voice.midiNote] * sampleRateRatio * globalPitchOffsetFactor;
+                        double centsFact = std::pow(2.0, (voice.playback.settings.pitchOffsetCents / 1200.0));
+                        double effectiveSpeed = newBaseDelta * centsFact;
+                        voice.playback.phaseInc = (int64_t)std::llround(effectiveSpeed * FIXED_ONE);
+                    }
+                }
             }
             else if constexpr (P == 1)
             {
@@ -293,6 +383,17 @@ namespace project
             else if constexpr (P == 2)
             {
                 sampleEndPercent = (float)v;
+                updateDerivedParameters();
+            }
+            else if constexpr (P == 3)
+            {
+                loopMode = (v >= 0.5);
+            }
+            else if constexpr (P == 4)
+            {
+                xfadeFraction = (float)v;
+                if (xfadeFraction < 0.f) xfadeFraction = 0.f;
+                if (xfadeFraction > 1.f) xfadeFraction = 1.f;
                 updateDerivedParameters();
             }
         }
@@ -306,9 +407,9 @@ namespace project
         void createParameters(ParameterDataList& data)
         {
             {
-                parameter::data pitchParam("Pitch (multiplier)", { 0.25, 4.0, 0.01 });
+                parameter::data pitchParam("Pitch (semitones)", { -24.0, 24.0, 0.01 });
                 registerCallback<0>(pitchParam);
-                pitchParam.setDefaultValue(1.0);
+                pitchParam.setDefaultValue(0.0);
                 data.add(std::move(pitchParam));
             }
             {
@@ -322,6 +423,18 @@ namespace project
                 registerCallback<2>(endParam);
                 endParam.setDefaultValue(1.0);
                 data.add(std::move(endParam));
+            }
+            {
+                parameter::data loopParam("Loop Mode", { 0.0, 1.0, 1.0 });
+                registerCallback<3>(loopParam);
+                loopParam.setDefaultValue(0.0);
+                data.add(std::move(loopParam));
+            }
+            {
+                parameter::data xfadeParam("Xfade Length", { 0.0, 1.0, 0.001 });
+                registerCallback<4>(xfadeParam);
+                xfadeParam.setDefaultValue(0.0);
+                data.add(std::move(xfadeParam));
             }
         }
     };
