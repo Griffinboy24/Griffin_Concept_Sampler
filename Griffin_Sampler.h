@@ -86,13 +86,11 @@ namespace project
             phaseInc = (int64_t)std::llround(effectiveSpeed * FIXED_ONE);
         }
 
-        // Synthesis loop: output one block of samples.
-        // This implements standard crossfade looping:
-        // - For positions p < (e - X): output sample normally.
-        // - For p in [e - X, e): output crossfade between tail (at p)
-        //   and head (at s + (p - (e - X))).
-        // When p reaches or exceeds e, subtract (e - s - X) so that
-        // the overlapping head region [s, s+X] is used.
+        // Synthesis loop: output one block of samples with equal-power crossfade looping.
+        // Standard behavior:
+        // - For p < (e - X): output sample normally.
+        // - For p in [e - X, e): blend tail at p and head at s + (p - (e - X)) using equal-power gains.
+        // When p >= e, subtract (e - s - X) so that the overlapping head region [s, s+X] is used.
         int vectorSynthesize(float* outL, float* outR, int blockSize)
         {
             if (!active)
@@ -105,12 +103,19 @@ namespace project
             const float ampLeft = amplitude * leftGain;
             const float ampRight = amplitude * rightGain;
 
-            // Precomputed loop values:
+            // Precompute invariant loop values.
             const bool loopEnabled = settings.loopMode;
-            const float X = settings.xfadeLengthInSamples; // crossfade length
+            const float X = settings.xfadeLengthInSamples; // crossfade length (already clamped)
             const float sOff = startOffset;
             const float eOff = endOffset;
             const float L = (eOff > sOff) ? (eOff - sOff) : 0.f; // total region length
+
+            // Precompute values for crossfade region if applicable.
+            const float crossfadeStart = eOff - X; // position where crossfade begins
+            const float invX = (X > 0.f) ? (1.f / X) : 0.f;
+            const float piOverTwo = float(M_PI * 0.5f);
+            // The effective unique portion length is (L - X); it is used in wrapping.
+            const float wrapAmt = std::max(L - X, 0.f);
 
             while (processed < blockSize)
             {
@@ -124,23 +129,26 @@ namespace project
                 }
 
                 float sampL = 0.f, sampR = 0.f;
-                // If looping with crossfade and X > 0, check if we're in the crossfade zone.
-                if (loopEnabled && X > 0.f && p >= (eOff - X))
+                if (loopEnabled && X > 0.f && p >= crossfadeStart)
                 {
-                    float alpha = (p - (eOff - X)) / X;
+                    // Compute equal-power crossfade factor.
+                    float alpha = (p - crossfadeStart) * invX;
+                    float crossAngle = alpha * piOverTwo;
+                    float tailGain = std::cos(crossAngle);
+                    float headGain = std::sin(crossAngle);
                     // Tail: sample at current position.
                     int idxTail = int(p);
                     float fracTail = p - float(idxTail);
                     float tailL = sourceL[idxTail] + fracTail * (sourceL[idxTail + 1] - sourceL[idxTail]);
                     float tailR = sourceR[idxTail] + fracTail * (sourceR[idxTail + 1] - sourceR[idxTail]);
                     // Head: corresponding sample from the beginning of the region.
-                    float headPos = sOff + (p - (eOff - X));
+                    float headPos = sOff + (p - crossfadeStart);
                     int idxHead = int(headPos);
                     float fracHead = headPos - float(idxHead);
                     float headL = sourceL[idxHead] + fracHead * (sourceL[idxHead + 1] - sourceL[idxHead]);
                     float headR = sourceR[idxHead] + fracHead * (sourceR[idxHead + 1] - sourceR[idxHead]);
-                    sampL = (1.f - alpha) * tailL + alpha * headL;
-                    sampR = (1.f - alpha) * tailR + alpha * headR;
+                    sampL = tailGain * tailL + headGain * headL;
+                    sampR = tailGain * tailR + headGain * headR;
                 }
                 else
                 {
@@ -160,13 +168,8 @@ namespace project
                 {
                     float p_next = float(phaseAcc >> FIXED_SHIFT) +
                         float(phaseAcc & FIXED_MASK) * invFixedOne;
-                    // When p_next exceeds the region, wrap it.
-                    // The effective unique portion is (eOff - sOff - X).
                     if (p_next >= eOff)
                     {
-                        float wrapAmt = (eOff - sOff - X);
-                        if (wrapAmt < 0.f)
-                            wrapAmt = 0.f;
                         p_next -= wrapAmt;
                         phaseAcc = (int64_t)std::llround(p_next * FIXED_ONE);
                     }
