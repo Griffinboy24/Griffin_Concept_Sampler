@@ -8,6 +8,7 @@
 #include <random>
 #include <limits>
 #include <new>
+#include <atomic>
 
 namespace project
 {
@@ -30,20 +31,20 @@ namespace project
     static constexpr int64_t FIXED_ONE = (int64_t)1 << FIXED_SHIFT;
     static constexpr int64_t FIXED_MASK = FIXED_ONE - 1;
 
-    // Settings for sample playback
+    // Sample settings now include playbackStart, loopStart and loopEnd.
     struct SampleSettings
     {
-        double pitchOffsetCents = 0.0;       // in cents; 0 means no detune
-        float  volumeMult = 1.0f;            // multiplies velocity
-        float  panning = 0.0f;               // -1 (L) to +1 (R)
-        float  startOffsetInSamples = 0.0f;  // absolute start (inside the file)
-        float  endOffsetInSamples = 0.0f;    // absolute end (inside the file)
-
-        bool   loopMode = false;             // false = one-shot, true = loop
-        float  xfadeLengthInSamples = 0.0f;  // actual crossfade length in samples (computed)
+        double pitchOffsetCents = 0.0;
+        float  volumeMult = 1.0f;
+        float  panning = 0.0f;
+        float  playbackStartInSamples = 0.0f;
+        float  loopStartInSamples = 0.0f;
+        float  loopEndInSamples = 0.0f;
+        bool   loopMode = false;
+        float  xfadeLengthInSamples = 0.0f;
     };
 
-    // Single instance of sample playback for a note.
+    // SamplePlayback: stores playback pointers and loop boundaries.
     struct SamplePlayback
     {
         const float* sourceL = nullptr;
@@ -53,12 +54,12 @@ namespace project
         SampleSettings settings;
         int64_t phaseAcc = 0;
         int64_t phaseInc = 0;
-        float startOffset = 0.0f; // s
-        float endOffset = 0.0f;   // e
+        float playbackStart = 0.0f;
+        float loopStart = 0.0f;
+        float loopEnd = 0.0f;
 
         SamplePlayback() noexcept = default;
 
-        // Constructor for sample playback (note voice)
         SamplePlayback(const std::array<const float*, 2>& src, float amp,
             const SampleSettings& s, int bufferLength, double baseDelta)
         {
@@ -68,30 +69,66 @@ namespace project
             amplitude = amp * s.volumeMult;
             active = true;
 
-            float sOff = s.startOffsetInSamples;
-            float eOff = s.endOffsetInSamples;
-            if (sOff < 0.f) sOff = 0.f;
-            if (sOff > float(bufferLength - 1)) sOff = float(bufferLength - 1);
-            if (eOff < 0.f) eOff = 0.f;
-            if (eOff > float(bufferLength - 1)) eOff = float(bufferLength - 1);
+            float pbStart = s.playbackStartInSamples;
+            if (pbStart < 0.f) pbStart = 0.f;
+            if (pbStart > float(bufferLength - 1)) pbStart = float(bufferLength - 1);
+            playbackStart = pbStart;
 
-            startOffset = sOff;
-            endOffset = eOff;
+            float lStart = s.loopStartInSamples;
+            float lEnd = s.loopEndInSamples;
+            if (!s.loopMode)
+            {
+                lStart = pbStart;
+                lEnd = s.loopEndInSamples; // one-shot: use parameter as sample end
+            }
+            else
+            {
+                if (lStart < 0.f) lStart = 0.f;
+                if (lStart > float(bufferLength - 1)) lStart = float(bufferLength - 1);
+                if (lEnd < 0.f) lEnd = 0.f;
+                if (lEnd > float(bufferLength - 1)) lEnd = float(bufferLength - 1);
+            }
+            loopStart = lStart;
+            loopEnd = lEnd;
 
-            // Begin playback at sample start.
-            phaseAcc = (int64_t)std::llround(sOff * FIXED_ONE);
-
+            phaseAcc = (int64_t)std::llround(pbStart * FIXED_ONE);
             double centsFact = std::pow(2.0, (s.pitchOffsetCents / 1200.0));
             double effectiveSpeed = baseDelta * centsFact;
             phaseInc = (int64_t)std::llround(effectiveSpeed * FIXED_ONE);
         }
 
-        // Synthesis loop: output one block of samples with equal-power crossfade looping.
-        // Standard behavior:
-        // - For p < (e - X): output sample normally.
-        // - For p in [e - X, e): blend tail at p and head at s + (p - (e - X)) using equal-power gains.
-        // When p >= e, subtract (e - s - X) so that the overlapping head region [s, s+X] is used.
-        int vectorSynthesize(float* outL, float* outR, int blockSize)
+        // New method: update settings for an active voice without resetting phaseAcc.
+        FORCE_INLINE void updateSettings(const SampleSettings& s, int bufferLength)
+        {
+            settings = s;
+            float pbStart = s.playbackStartInSamples;
+            if (pbStart < 0.f) pbStart = 0.f;
+            if (pbStart > float(bufferLength - 1)) pbStart = float(bufferLength - 1);
+            // Do not modify phaseAcc to preserve current playback position.
+            playbackStart = pbStart;
+            float lStart = s.loopStartInSamples;
+            float lEnd = s.loopEndInSamples;
+            if (!s.loopMode)
+            {
+                lStart = pbStart;
+                lEnd = s.loopEndInSamples; // one-shot: use provided loop end parameter
+            }
+            else
+            {
+                if (lStart < 0.f) lStart = 0.f;
+                if (lStart > float(bufferLength - 1)) lStart = float(bufferLength - 1);
+                if (lEnd < 0.f) lEnd = 0.f;
+                if (lEnd > float(bufferLength - 1)) lEnd = float(bufferLength - 1);
+            }
+            loopStart = lStart;
+            loopEnd = lEnd;
+        }
+
+        // vectorSynthesize outputs one block of samples.
+        // For looping: the unique region is [loopStart, loopEnd - X) and the crossfade zone is [loopEnd - X, loopEnd).
+        // When p reaches loopEnd, we subtract (loopEnd - (loopStart + X)) so that if p == loopEnd, new p == loopStart + X.
+        int vectorSynthesize(float* outL, float* outR, int blockSize,
+            const AudioBuffer<float>* preXfadeBuffer, float preXfadeLength)
         {
             if (!active)
                 return 0;
@@ -103,77 +140,103 @@ namespace project
             const float ampLeft = amplitude * leftGain;
             const float ampRight = amplitude * rightGain;
 
-            // Precompute invariant loop values.
             const bool loopEnabled = settings.loopMode;
-            const float X = settings.xfadeLengthInSamples; // crossfade length (already clamped)
-            const float sOff = startOffset;
-            const float eOff = endOffset;
-            const float L = (eOff > sOff) ? (eOff - sOff) : 0.f; // total region length
-
-            // Precompute values for crossfade region if applicable.
-            const float crossfadeStart = eOff - X; // position where crossfade begins
-            const float invX = (X > 0.f) ? (1.f / X) : 0.f;
+            const float X = settings.xfadeLengthInSamples; // crossfade length
+            const float endSample = loopEnd; // B
+            // Crossfade zone from (B - X) to B.
+            const float crossfadeStart = (loopEnabled ? endSample - X : 0.f);
             const float piOverTwo = float(M_PI * 0.5f);
-            // The effective unique portion length is (L - X); it is used in wrapping.
-            const float wrapAmt = std::max(L - X, 0.f);
 
             while (processed < blockSize)
             {
                 float p = float(phaseAcc >> FIXED_SHIFT) +
                     float(phaseAcc & FIXED_MASK) * invFixedOne;
 
-                if (!loopEnabled && p >= eOff)
+                if (!loopEnabled)
                 {
-                    active = false;
-                    break;
-                }
-
-                float sampL = 0.f, sampR = 0.f;
-                if (loopEnabled && X > 0.f && p >= crossfadeStart)
-                {
-                    // Compute equal-power crossfade factor.
-                    float alpha = (p - crossfadeStart) * invX;
-                    float crossAngle = alpha * piOverTwo;
-                    float tailGain = std::cos(crossAngle);
-                    float headGain = std::sin(crossAngle);
-                    // Tail: sample at current position.
-                    int idxTail = int(p);
-                    float fracTail = p - float(idxTail);
-                    float tailL = sourceL[idxTail] + fracTail * (sourceL[idxTail + 1] - sourceL[idxTail]);
-                    float tailR = sourceR[idxTail] + fracTail * (sourceR[idxTail + 1] - sourceR[idxTail]);
-                    // Head: corresponding sample from the beginning of the region.
-                    float headPos = sOff + (p - crossfadeStart);
-                    int idxHead = int(headPos);
-                    float fracHead = headPos - float(idxHead);
-                    float headL = sourceL[idxHead] + fracHead * (sourceL[idxHead + 1] - sourceL[idxHead]);
-                    float headR = sourceR[idxHead] + fracHead * (sourceR[idxHead + 1] - sourceR[idxHead]);
-                    sampL = tailGain * tailL + headGain * headL;
-                    sampR = tailGain * tailR + headGain * headR;
+                    if (p >= endSample)
+                    {
+                        active = false;
+                        break;
+                    }
                 }
                 else
                 {
-                    int idx = int(p);
-                    float frac = p - float(idx);
-                    sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
-                    sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+                    if (p < loopStart)
+                    {
+                        // Not yet in loop region.
+                    }
+                    else
+                    {
+                        if (p >= endSample)
+                        {
+                            // Compute excess beyond loopEnd.
+                            float excess = p - endSample;
+                            // Effective loop length is (endSample - (loopStart + X)).
+                            p = loopStart + X + excess;
+                            phaseAcc = (int64_t)std::llround(p * FIXED_ONE);
+                        }
+                        else if (p >= crossfadeStart)
+                        {
+                            // In crossfade zone: output from precomputed buffer if available.
+                            if (preXfadeBuffer != nullptr)
+                            {
+                                float posInXfade = p - crossfadeStart; // 0..X
+                                int idx = int(posInXfade);
+                                float frac = posInXfade - idx;
+                                int bufferLength = preXfadeBuffer->getNumSamples();
+                                if (idx < 0)
+                                    idx = 0;
+                                else if (idx >= bufferLength - 1)
+                                    idx = bufferLength - 2;
+                                const float* xfadeL = preXfadeBuffer->getReadPointer(0);
+                                const float* xfadeR = preXfadeBuffer->getReadPointer(1);
+                                float sampL = xfadeL[idx] + frac * (xfadeL[idx + 1] - xfadeL[idx]);
+                                float sampR = xfadeR[idx] + frac * (xfadeR[idx + 1] - xfadeR[idx]);
+                                outL[processed] += sampL * ampLeft;
+                                outR[processed] += sampR * ampRight;
+                                processed++;
+                                phaseAcc += phaseInc;
+                                continue;
+                            }
+                            else
+                            {
+                                // Fallback on-the-fly computation.
+                                float alpha = (p - crossfadeStart) / X;
+                                float crossAngle = alpha * piOverTwo;
+                                float tailGain = std::cos(crossAngle);
+                                float headGain = std::sin(crossAngle);
+                                int idx = int(p);
+                                float frac = p - idx;
+                                float sampTailL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
+                                float sampTailR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+                                float headPos = loopStart + (p - crossfadeStart);
+                                int idxHead = int(headPos);
+                                float fracHead = headPos - idxHead;
+                                float sampHeadL = sourceL[idxHead] + fracHead * (sourceL[idxHead + 1] - sourceL[idxHead]);
+                                float sampHeadR = sourceR[idxHead] + fracHead * (sourceR[idxHead + 1] - sourceR[idxHead]);
+                                sampTailL = tailGain * sampTailL + headGain * sampHeadL;
+                                sampTailR = tailGain * sampTailR + headGain * sampHeadR;
+                                outL[processed] += sampTailL * ampLeft;
+                                outR[processed] += sampTailR * ampRight;
+                                processed++;
+                                phaseAcc += phaseInc;
+                                continue;
+                            }
+                        }
+                    }
                 }
+
+                // Normal playback (outside loop region or before crossfade)
+                int idx = int(p);
+                float frac = p - float(idx);
+                float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
+                float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
 
                 outL[processed] += sampL * ampLeft;
                 outR[processed] += sampR * ampRight;
                 processed++;
-
                 phaseAcc += phaseInc;
-
-                if (loopEnabled)
-                {
-                    float p_next = float(phaseAcc >> FIXED_SHIFT) +
-                        float(phaseAcc & FIXED_MASK) * invFixedOne;
-                    if (p_next >= eOff)
-                    {
-                        p_next -= wrapAmt;
-                        phaseAcc = (int64_t)std::llround(p_next * FIXED_ONE);
-                    }
-                }
             }
             return processed;
         }
@@ -184,9 +247,8 @@ namespace project
         int midiNote = 60;
         bool isActive = false;
         float velocity = 1.0f;
-        SamplePlayback playback; // instance of sample playback
+        SamplePlayback playback;
 
-        // Reset the voice with a new SamplePlayback.
         void reset(int note, float vel, const std::array<const float*, 2>& sample,
             int bufferLength, double baseDelta, const SampleSettings& settings)
         {
@@ -197,6 +259,12 @@ namespace project
         }
     };
 
+    // Griffin_Sampler now uses six parameters.
+    // Parameter 1: Playhead Start percent
+    // Parameter 2: Loop Start percent
+    // Parameter 3: Loop End percent
+    // Parameter 4: Xfade Length (relative fraction)
+    // Parameter 5: Loop Mode (enabled if >= 0.5)
     template <int NV>
     struct Griffin_Sampler : public data::base
     {
@@ -223,22 +291,23 @@ namespace project
         double sampleRate = 44100.0;
         double sampleRateRatio = 1.0;
 
-        // Playback range parameters (percent)
         float sampleStartPercent = 0.0f;
-        float sampleEndPercent = 1.0f;
-        float sampleStartOffsetInSamples = 0.0f;
-        float sampleEndOffsetInSamples = 0.0f;
+        float loopStartPercent = 0.0f;
+        float loopEndPercent = 1.0f;
+
+        float playbackStartOffsetInSamples = 0.0f;
+        float loopStartOffsetInSamples = 0.0f;
+        float loopEndOffsetInSamples = 0.0f;
 
         double globalPitchOffsetFactor = 1.0;
 
-        // Loop / crossfade parameters
-        bool  loopMode = false;            // Parameter 3
-        float xfadeFraction = 0.0f;         // Parameter 4 (0..1)
-        float xfadeLengthInSamples = 0.0f;  // Computed crossfade length
+        float xfadeFraction = 0.0f;
+        float xfadeLengthInSamples = 0.0f;
+        bool  loopMode = false;
 
         std::mt19937 randomGen;
+        std::atomic<AudioBuffer<float>*> precomputedXfadeBuffer{ nullptr };
 
-        // Load external sample data.
         void setExternalData(const ExternalData& ed, int)
         {
             sampleData = ed;
@@ -272,19 +341,58 @@ namespace project
             if (currentSampleLength < 1)
                 currentSampleLength = 1;
 
-            sampleStartOffsetInSamples = sampleStartPercent * float(currentSampleLength - 1);
-            sampleEndOffsetInSamples = sampleEndPercent * float(currentSampleLength - 1);
+            playbackStartOffsetInSamples = sampleStartPercent * float(currentSampleLength - 1);
+            loopStartOffsetInSamples = loopStartPercent * float(currentSampleLength - 1);
+            loopEndOffsetInSamples = loopEndPercent * float(currentSampleLength - 1);
 
-            float regionLen = sampleEndOffsetInSamples - sampleStartOffsetInSamples;
+            float regionLen = loopEndOffsetInSamples - loopStartOffsetInSamples;
             if (regionLen < 0.f)
                 regionLen = 0.f;
 
-            // Clamp crossfade: maximum allowed is half the region.
             float maxXfade = regionLen * 0.5f;
             float desiredXfade = xfadeFraction * regionLen;
             if (desiredXfade > maxXfade)
                 desiredXfade = maxXfade;
             xfadeLengthInSamples = desiredXfade;
+
+            if (loopMode && xfadeLengthInSamples > 0.f && sampleBuffer.getNumSamples() > 0)
+            {
+                int xfadeSamples = std::max(1, (int)std::round(xfadeLengthInSamples));
+                auto* newXfadeBuffer = new AudioBuffer<float>(2, xfadeSamples);
+                for (int ch = 0; ch < 2; ++ch)
+                {
+                    float* dest = newXfadeBuffer->getWritePointer(ch);
+                    const float* src = sampleBuffer.getReadPointer(std::min(ch, sampleBuffer.getNumChannels() - 1));
+                    for (int i = 0; i < xfadeSamples; i++)
+                    {
+                        float pos = float(i);
+                        float alpha = (xfadeSamples > 1 ? pos / float(xfadeSamples - 1) : 0.f);
+                        float tailGain = std::cos(alpha * (float(M_PI) * 0.5f));
+                        float headGain = std::sin(alpha * (float(M_PI) * 0.5f));
+                        float tailPos = loopEndOffsetInSamples - xfadeLengthInSamples + pos;
+                        float headPos = loopStartOffsetInSamples + pos;
+                        int tailIdx = int(tailPos);
+                        int headIdx = int(headPos);
+                        float tailFrac = tailPos - tailIdx;
+                        float headFrac = headPos - headIdx;
+                        int numSamples = sampleBuffer.getNumSamples();
+                        int tailIdx1 = std::min(tailIdx + 1, numSamples - 1);
+                        int headIdx1 = std::min(headIdx + 1, numSamples - 1);
+                        float tailSample = src[tailIdx] + tailFrac * (src[tailIdx1] - src[tailIdx]);
+                        float headSample = src[headIdx] + headFrac * (src[headIdx1] - src[headIdx]);
+                        dest[i] = tailGain * tailSample + headGain * headSample;
+                    }
+                }
+                AudioBuffer<float>* oldBuffer = precomputedXfadeBuffer.exchange(newXfadeBuffer);
+                if (oldBuffer)
+                    delete oldBuffer;
+            }
+            else
+            {
+                AudioBuffer<float>* oldBuffer = precomputedXfadeBuffer.exchange(nullptr);
+                if (oldBuffer)
+                    delete oldBuffer;
+            }
         }
 
         void reset()
@@ -303,7 +411,6 @@ namespace project
             randomGen.seed(rd());
         }
 
-        // On note on, schedule a voice.
         void handleHiseEvent(HiseEvent& e)
         {
             if (e.isNoteOn())
@@ -314,8 +421,9 @@ namespace project
                 settings.pitchOffsetCents = 0.0;
                 settings.volumeMult = 1.0f;
                 settings.panning = 0.0f;
-                settings.startOffsetInSamples = sampleStartOffsetInSamples;
-                settings.endOffsetInSamples = sampleEndOffsetInSamples;
+                settings.playbackStartInSamples = playbackStartOffsetInSamples;
+                settings.loopStartInSamples = loopStartOffsetInSamples;
+                settings.loopEndInSamples = loopEndOffsetInSamples;
                 settings.loopMode = loopMode;
                 settings.xfadeLengthInSamples = xfadeLengthInSamples;
                 voice.reset(e.getNoteNumber(), e.getFloatVelocity(), sample,
@@ -341,12 +449,14 @@ namespace project
             std::fill(leftChannel, leftChannel + totalSamples, 0.f);
             std::fill(rightChannel, rightChannel + totalSamples, 0.f);
 
+            AudioBuffer<float>* currentXfadeBuffer = precomputedXfadeBuffer.load();
             for (auto& voice : voices)
             {
                 if (!voice.isActive)
                     continue;
 
-                int n = voice.playback.vectorSynthesize(leftChannel, rightChannel, totalSamples);
+                int n = voice.playback.vectorSynthesize(leftChannel, rightChannel, totalSamples,
+                    currentXfadeBuffer, xfadeLengthInSamples);
                 if (!voice.playback.active)
                     voice.isActive = false;
             }
@@ -355,12 +465,6 @@ namespace project
         template <typename FrameDataType>
         void processFrame(FrameDataType&) {}
 
-        // Parameter mapping:
-        // 0: Pitch (semitones, -24 to 24)
-        // 1: Sample Start (percent)
-        // 2: Sample End (percent)
-        // 3: Loop Mode (0..1; false if <0.5)
-        // 4: Xfade Length (0..1)
         template <int P>
         void setParameter(double v)
         {
@@ -385,12 +489,13 @@ namespace project
             }
             else if constexpr (P == 2)
             {
-                sampleEndPercent = (float)v;
+                loopStartPercent = (float)v;
                 updateDerivedParameters();
             }
             else if constexpr (P == 3)
             {
-                loopMode = (v >= 0.5);
+                loopEndPercent = (float)v;
+                updateDerivedParameters();
             }
             else if constexpr (P == 4)
             {
@@ -398,6 +503,31 @@ namespace project
                 if (xfadeFraction < 0.f) xfadeFraction = 0.f;
                 if (xfadeFraction > 1.f) xfadeFraction = 1.f;
                 updateDerivedParameters();
+            }
+            else if constexpr (P == 5)
+            {
+                loopMode = (v >= 0.5);
+                updateDerivedParameters();
+            }
+            if constexpr (P >= 1 && P <= 5)
+            {
+                // Update all active voices with the new boundaries and parameters.
+                for (auto& voice : voices)
+                {
+                    if (voice.isActive)
+                    {
+                        SampleSettings newSettings;
+                        newSettings.pitchOffsetCents = voice.playback.settings.pitchOffsetCents;
+                        newSettings.volumeMult = voice.playback.settings.volumeMult;
+                        newSettings.panning = voice.playback.settings.panning;
+                        newSettings.playbackStartInSamples = playbackStartOffsetInSamples;
+                        newSettings.loopStartInSamples = loopStartOffsetInSamples;
+                        newSettings.loopEndInSamples = loopEndOffsetInSamples;
+                        newSettings.loopMode = loopMode;
+                        newSettings.xfadeLengthInSamples = xfadeLengthInSamples;
+                        voice.playback.updateSettings(newSettings, sampleBuffer.getNumSamples());
+                    }
+                }
             }
         }
 
@@ -416,28 +546,34 @@ namespace project
                 data.add(std::move(pitchParam));
             }
             {
-                parameter::data startParam("Sample Start", { 0.0, 1.0, 0.001 });
+                parameter::data startParam("Playhead Start", { 0.0, 1.0, 0.001 });
                 registerCallback<1>(startParam);
                 startParam.setDefaultValue(0.0);
                 data.add(std::move(startParam));
             }
             {
-                parameter::data endParam("Sample End", { 0.0, 1.0, 0.001 });
-                registerCallback<2>(endParam);
-                endParam.setDefaultValue(1.0);
-                data.add(std::move(endParam));
+                parameter::data loopStartParam("Loop Start", { 0.0, 1.0, 0.001 });
+                registerCallback<2>(loopStartParam);
+                loopStartParam.setDefaultValue(0.0);
+                data.add(std::move(loopStartParam));
             }
             {
-                parameter::data loopParam("Loop Mode", { 0.0, 1.0, 1.0 });
-                registerCallback<3>(loopParam);
-                loopParam.setDefaultValue(0.0);
-                data.add(std::move(loopParam));
+                parameter::data loopEndParam("Loop End", { 0.0, 1.0, 0.001 });
+                registerCallback<3>(loopEndParam);
+                loopEndParam.setDefaultValue(1.0);
+                data.add(std::move(loopEndParam));
             }
             {
                 parameter::data xfadeParam("Xfade Length", { 0.0, 1.0, 0.001 });
                 registerCallback<4>(xfadeParam);
                 xfadeParam.setDefaultValue(0.0);
                 data.add(std::move(xfadeParam));
+            }
+            {
+                parameter::data loopModeParam("Loop Mode", { 0.0, 1.0, 1.0 });
+                registerCallback<5>(loopModeParam);
+                loopModeParam.setDefaultValue(0.0);
+                data.add(std::move(loopModeParam));
             }
         }
     };
