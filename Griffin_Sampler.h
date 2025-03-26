@@ -31,7 +31,6 @@ namespace project
     static constexpr int64_t FIXED_ONE = (int64_t)1 << FIXED_SHIFT;
     static constexpr int64_t FIXED_MASK = FIXED_ONE - 1;
 
-    // Sample settings now include playbackStart, loopStart and loopEnd.
     struct SampleSettings
     {
         double pitchOffsetCents = 0.0;
@@ -44,7 +43,6 @@ namespace project
         float  xfadeLengthInSamples = 0.0f;
     };
 
-    // SamplePlayback: stores playback pointers and loop boundaries.
     struct SamplePlayback
     {
         const float* sourceL = nullptr;
@@ -70,8 +68,10 @@ namespace project
             active = true;
 
             float pbStart = s.playbackStartInSamples;
-            if (pbStart < 0.f) pbStart = 0.f;
-            if (pbStart > float(bufferLength - 1)) pbStart = float(bufferLength - 1);
+            if (pbStart < 0.f)
+                pbStart = 0.f;
+            if (pbStart > float(bufferLength - 1))
+                pbStart = float(bufferLength - 1);
             playbackStart = pbStart;
 
             float lStart = s.loopStartInSamples;
@@ -79,14 +79,18 @@ namespace project
             if (!s.loopMode)
             {
                 lStart = pbStart;
-                lEnd = s.loopEndInSamples; // one-shot: use parameter as sample end
+                lEnd = s.loopEndInSamples;
             }
             else
             {
-                if (lStart < 0.f) lStart = 0.f;
-                if (lStart > float(bufferLength - 1)) lStart = float(bufferLength - 1);
-                if (lEnd < 0.f) lEnd = 0.f;
-                if (lEnd > float(bufferLength - 1)) lEnd = float(bufferLength - 1);
+                if (lStart < 0.f)
+                    lStart = 0.f;
+                if (lStart > float(bufferLength - 1))
+                    lStart = float(bufferLength - 1);
+                if (lEnd < 0.f)
+                    lEnd = 0.f;
+                if (lEnd > float(bufferLength - 1))
+                    lEnd = float(bufferLength - 1);
             }
             loopStart = lStart;
             loopEnd = lEnd;
@@ -97,36 +101,39 @@ namespace project
             phaseInc = (int64_t)std::llround(effectiveSpeed * FIXED_ONE);
         }
 
-        // New method: update settings for an active voice without resetting phaseAcc.
+        // Update settings without resetting phaseAcc.
         FORCE_INLINE void updateSettings(const SampleSettings& s, int bufferLength)
         {
             settings = s;
             float pbStart = s.playbackStartInSamples;
-            if (pbStart < 0.f) pbStart = 0.f;
-            if (pbStart > float(bufferLength - 1)) pbStart = float(bufferLength - 1);
-            // Do not modify phaseAcc to preserve current playback position.
+            if (pbStart < 0.f)
+                pbStart = 0.f;
+            if (pbStart > float(bufferLength - 1))
+                pbStart = float(bufferLength - 1);
             playbackStart = pbStart;
             float lStart = s.loopStartInSamples;
             float lEnd = s.loopEndInSamples;
             if (!s.loopMode)
             {
                 lStart = pbStart;
-                lEnd = s.loopEndInSamples; // one-shot: use provided loop end parameter
+                lEnd = s.loopEndInSamples;
             }
             else
             {
-                if (lStart < 0.f) lStart = 0.f;
-                if (lStart > float(bufferLength - 1)) lStart = float(bufferLength - 1);
-                if (lEnd < 0.f) lEnd = 0.f;
-                if (lEnd > float(bufferLength - 1)) lEnd = float(bufferLength - 1);
+                if (lStart < 0.f)
+                    lStart = 0.f;
+                if (lStart > float(bufferLength - 1))
+                    lStart = float(bufferLength - 1);
+                if (lEnd < 0.f)
+                    lEnd = 0.f;
+                if (lEnd > float(bufferLength - 1))
+                    lEnd = float(bufferLength - 1);
             }
             loopStart = lStart;
             loopEnd = lEnd;
         }
 
-        // vectorSynthesize outputs one block of samples.
-        // For looping: the unique region is [loopStart, loopEnd - X) and the crossfade zone is [loopEnd - X, loopEnd).
-        // When p reaches loopEnd, we subtract (loopEnd - (loopStart + X)) so that if p == loopEnd, new p == loopStart + X.
+        // Highly optimized vectorSynthesize using fixed-point arithmetic and precomputed boundaries.
         int vectorSynthesize(float* outL, float* outR, int blockSize,
             const AudioBuffer<float>* preXfadeBuffer, float preXfadeLength)
         {
@@ -139,104 +146,151 @@ namespace project
             const float rightGain = 0.5f * (1.f + settings.panning);
             const float ampLeft = amplitude * leftGain;
             const float ampRight = amplitude * rightGain;
-
             const bool loopEnabled = settings.loopMode;
-            const float X = settings.xfadeLengthInSamples; // crossfade length
-            const float endSample = loopEnd; // B
-            // Crossfade zone from (B - X) to B.
-            const float crossfadeStart = (loopEnabled ? endSample - X : 0.f);
+            const float X = settings.xfadeLengthInSamples;
+            const float endSample = loopEnd;
+            // For crossfade region, compute the float boundary.
+            const float crossfadeStartF = loopEnabled ? (endSample - X) : 0.f;
             const float piOverTwo = float(M_PI * 0.5f);
+            // Precompute fixed–point boundaries.
+            const int64_t fixedEnd = int64_t(endSample * FIXED_ONE);
+            int64_t fixedLoopStart = 0;
+            int64_t fixedCrossfadeStart = 0;
+            int64_t fixedX = 0;
+            if (loopEnabled)
+            {
+                fixedLoopStart = int64_t(loopStart * FIXED_ONE);
+                fixedX = (int64_t)std::llround(X * FIXED_ONE);
+                fixedCrossfadeStart = fixedEnd - fixedX;
+            }
 
+            // Main processing loop.
             while (processed < blockSize)
             {
-                float p = float(phaseAcc >> FIXED_SHIFT) +
-                    float(phaseAcc & FIXED_MASK) * invFixedOne;
-
+                // Process using phaseAcc in fixed point.
                 if (!loopEnabled)
                 {
-                    if (p >= endSample)
+                    if (phaseAcc >= fixedEnd)
                     {
                         active = false;
                         break;
                     }
+                    // Compute number of samples until reaching fixedEnd.
+                    int64_t samplesToBoundary = (fixedEnd - phaseAcc + phaseInc - 1) / phaseInc;
+                    int n = (samplesToBoundary > (blockSize - processed)) ? (blockSize - processed) : int(samplesToBoundary);
+                    for (int i = 0; i < n; i++)
+                    {
+                        int idx = int(phaseAcc >> FIXED_SHIFT);
+                        float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
+                        float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
+                        float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+                        outL[processed + i] += sampL * ampLeft;
+                        outR[processed + i] += sampR * ampRight;
+                        phaseAcc += phaseInc;
+                    }
+                    processed += n;
                 }
                 else
                 {
-                    if (p < loopStart)
+                    if (phaseAcc < fixedLoopStart)
                     {
-                        // Not yet in loop region.
+                        // Process until entering loop region.
+                        int64_t samplesToBoundary = (fixedLoopStart - phaseAcc + phaseInc - 1) / phaseInc;
+                        int n = (samplesToBoundary > (blockSize - processed)) ? (blockSize - processed) : int(samplesToBoundary);
+                        for (int i = 0; i < n; i++)
+                        {
+                            int idx = int(phaseAcc >> FIXED_SHIFT);
+                            float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
+                            float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
+                            float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+                            outL[processed + i] += sampL * ampLeft;
+                            outR[processed + i] += sampR * ampRight;
+                            phaseAcc += phaseInc;
+                        }
+                        processed += n;
+                    }
+                    else if (phaseAcc >= fixedEnd)
+                    {
+                        // Wrap-around: compute excess and restart at loop start plus crossfade.
+                        int64_t excess = phaseAcc - fixedEnd;
+                        phaseAcc = fixedLoopStart + fixedX + excess;
+                        continue;
+                    }
+                    else if (phaseAcc < fixedCrossfadeStart)
+                    {
+                        // Process normal playback until entering crossfade region.
+                        int64_t samplesToBoundary = (fixedCrossfadeStart - phaseAcc + phaseInc - 1) / phaseInc;
+                        int n = (samplesToBoundary > (blockSize - processed)) ? (blockSize - processed) : int(samplesToBoundary);
+                        for (int i = 0; i < n; i++)
+                        {
+                            int idx = int(phaseAcc >> FIXED_SHIFT);
+                            float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
+                            float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
+                            float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
+                            outL[processed + i] += sampL * ampLeft;
+                            outR[processed + i] += sampR * ampRight;
+                            phaseAcc += phaseInc;
+                        }
+                        processed += n;
                     }
                     else
                     {
-                        if (p >= endSample)
+                        // Crossfade region.
+                        int64_t samplesToBoundary = (fixedEnd - phaseAcc + phaseInc - 1) / phaseInc;
+                        int n = (samplesToBoundary > (blockSize - processed)) ? (blockSize - processed) : int(samplesToBoundary);
+                        if (preXfadeBuffer)
                         {
-                            // Compute excess beyond loopEnd.
-                            float excess = p - endSample;
-                            // Effective loop length is (endSample - (loopStart + X)).
-                            p = loopStart + X + excess;
-                            phaseAcc = (int64_t)std::llround(p * FIXED_ONE);
-                        }
-                        else if (p >= crossfadeStart)
-                        {
-                            // In crossfade zone: output from precomputed buffer if available.
-                            if (preXfadeBuffer != nullptr)
+                            const float* xfadeL = preXfadeBuffer->getReadPointer(0);
+                            const float* xfadeR = preXfadeBuffer->getReadPointer(1);
+                            int xfadeBufferLen = preXfadeBuffer->getNumSamples();
+                            for (int i = 0; i < n; i++)
                             {
-                                float posInXfade = p - crossfadeStart; // 0..X
+                                int idxPhase = int(phaseAcc >> FIXED_SHIFT);
+                                float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
+                                // Convert current phase to float.
+                                float currentP = float(phaseAcc) * invFixedOne;
+                                float posInXfade = currentP - crossfadeStartF;
                                 int idx = int(posInXfade);
-                                float frac = posInXfade - idx;
-                                int bufferLength = preXfadeBuffer->getNumSamples();
+                                float subFrac = posInXfade - idx;
                                 if (idx < 0)
                                     idx = 0;
-                                else if (idx >= bufferLength - 1)
-                                    idx = bufferLength - 2;
-                                const float* xfadeL = preXfadeBuffer->getReadPointer(0);
-                                const float* xfadeR = preXfadeBuffer->getReadPointer(1);
-                                float sampL = xfadeL[idx] + frac * (xfadeL[idx + 1] - xfadeL[idx]);
-                                float sampR = xfadeR[idx] + frac * (xfadeR[idx + 1] - xfadeR[idx]);
-                                outL[processed] += sampL * ampLeft;
-                                outR[processed] += sampR * ampRight;
-                                processed++;
+                                else if (idx >= xfadeBufferLen - 1)
+                                    idx = xfadeBufferLen - 2;
+                                float sampL = xfadeL[idx] + subFrac * (xfadeL[idx + 1] - xfadeL[idx]);
+                                float sampR = xfadeR[idx] + subFrac * (xfadeR[idx + 1] - xfadeR[idx]);
+                                outL[processed + i] += sampL * ampLeft;
+                                outR[processed + i] += sampR * ampRight;
                                 phaseAcc += phaseInc;
-                                continue;
                             }
-                            else
+                        }
+                        else
+                        {
+                            for (int i = 0; i < n; i++)
                             {
-                                // Fallback on-the-fly computation.
-                                float alpha = (p - crossfadeStart) / X;
+                                int idxPhase = int(phaseAcc >> FIXED_SHIFT);
+                                float frac = float(phaseAcc & FIXED_MASK) * invFixedOne;
+                                float currentP = float(phaseAcc) * invFixedOne;
+                                float alpha = (currentP - crossfadeStartF) / X;
                                 float crossAngle = alpha * piOverTwo;
                                 float tailGain = std::cos(crossAngle);
                                 float headGain = std::sin(crossAngle);
-                                int idx = int(p);
-                                float frac = p - idx;
-                                float sampTailL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
-                                float sampTailR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
-                                float headPos = loopStart + (p - crossfadeStart);
+                                float sampTailL = sourceL[idxPhase] + frac * (sourceL[idxPhase + 1] - sourceL[idxPhase]);
+                                float sampTailR = sourceR[idxPhase] + frac * (sourceR[idxPhase + 1] - sourceR[idxPhase]);
+                                float headPos = float(fixedLoopStart) * invFixedOne + (currentP - crossfadeStartF);
                                 int idxHead = int(headPos);
                                 float fracHead = headPos - idxHead;
                                 float sampHeadL = sourceL[idxHead] + fracHead * (sourceL[idxHead + 1] - sourceL[idxHead]);
                                 float sampHeadR = sourceR[idxHead] + fracHead * (sourceR[idxHead + 1] - sourceR[idxHead]);
-                                sampTailL = tailGain * sampTailL + headGain * sampHeadL;
-                                sampTailR = tailGain * sampTailR + headGain * sampHeadR;
-                                outL[processed] += sampTailL * ampLeft;
-                                outR[processed] += sampTailR * ampRight;
-                                processed++;
+                                float mixL = tailGain * sampTailL + headGain * sampHeadL;
+                                float mixR = tailGain * sampTailR + headGain * sampHeadR;
+                                outL[processed + i] += mixL * ampLeft;
+                                outR[processed + i] += mixR * ampRight;
                                 phaseAcc += phaseInc;
-                                continue;
                             }
                         }
+                        processed += n;
                     }
                 }
-
-                // Normal playback (outside loop region or before crossfade)
-                int idx = int(p);
-                float frac = p - float(idx);
-                float sampL = sourceL[idx] + frac * (sourceL[idx + 1] - sourceL[idx]);
-                float sampR = sourceR[idx] + frac * (sourceR[idx + 1] - sourceR[idx]);
-
-                outL[processed] += sampL * ampLeft;
-                outR[processed] += sampR * ampRight;
-                processed++;
-                phaseAcc += phaseInc;
             }
             return processed;
         }
@@ -259,12 +313,6 @@ namespace project
         }
     };
 
-    // Griffin_Sampler now uses six parameters.
-    // Parameter 1: Playhead Start percent
-    // Parameter 2: Loop Start percent
-    // Parameter 3: Loop End percent
-    // Parameter 4: Xfade Length (relative fraction)
-    // Parameter 5: Loop Mode (enabled if >= 0.5)
     template <int NV>
     struct Griffin_Sampler : public data::base
     {
@@ -500,8 +548,10 @@ namespace project
             else if constexpr (P == 4)
             {
                 xfadeFraction = (float)v;
-                if (xfadeFraction < 0.f) xfadeFraction = 0.f;
-                if (xfadeFraction > 1.f) xfadeFraction = 1.f;
+                if (xfadeFraction < 0.f)
+                    xfadeFraction = 0.f;
+                if (xfadeFraction > 1.f)
+                    xfadeFraction = 1.f;
                 updateDerivedParameters();
             }
             else if constexpr (P == 5)
@@ -511,7 +561,6 @@ namespace project
             }
             if constexpr (P >= 1 && P <= 5)
             {
-                // Update all active voices with the new boundaries and parameters.
                 for (auto& voice : voices)
                 {
                     if (voice.isActive)
@@ -540,7 +589,7 @@ namespace project
         void createParameters(ParameterDataList& data)
         {
             {
-                parameter::data pitchParam("Pitch (semitones)", { -24.0, 24.0, 0.01 });
+                parameter::data pitchParam("Pitch (semitones)", { -48.0, 24.0, 0.01 });
                 registerCallback<0>(pitchParam);
                 pitchParam.setDefaultValue(0.0);
                 data.add(std::move(pitchParam));
@@ -558,7 +607,7 @@ namespace project
                 data.add(std::move(loopStartParam));
             }
             {
-                parameter::data loopEndParam("Loop End", { 0.0, 1.0, 0.001 });
+                parameter::data loopEndParam("Sample End", { 0.0, 1.0, 0.001 });
                 registerCallback<3>(loopEndParam);
                 loopEndParam.setDefaultValue(1.0);
                 data.add(std::move(loopEndParam));
